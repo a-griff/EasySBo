@@ -1,0 +1,1246 @@
+#!/bin/bash
+# easysbo — dependency-aware builder/installer for SlackBuilds.org
+# Focused on SlackBuilds only (no Slackware official updates).
+
+set -euo pipefail
+
+#===============================================================================
+# CONFIG — user-tunable knobs
+#===============================================================================
+WORKDIR="/etc/easysbo"
+SBO_PARENT="$WORKDIR/SBo"              # local SBo trees: $SBO_PARENT/<branch>
+BUILDROOT="$WORKDIR/build"             # per-pkg build workspace
+SRCROOT="$WORKDIR/sources"             # cached source tarballs
+
+# sbopkg-like output locations (final packages end up here)
+TMPROOT="/tmp/SBo"                     # SlackBuild TMP
+OUTBASE="/tmp/SBo/packages"            # SlackBuild OUTPUT/<pkg>/*.t?z
+
+# Mirrors used to sync SBo tree
+SBO_RSYNC_PRIMARY="rsync://slackbuilds.org/slackbuilds"
+SBO_RSYNC_FALLBACK="rsync://slackware.uk/slackbuilds.org/slackbuilds"
+SBO_GIT_URL="https://git.slackbuilds.org/slackbuilds"
+
+# If latest stable cannot be discovered, fall back to this numeric branch:
+LATEST_STABLE_FALLBACK="15.0"
+
+# Ignore these when reporting/installing missing deps (provided by Slackware base)
+BASE_PKGS_IGNORE=(
+  gcc make cmake ninja perl python python3 python2
+  autoconf automake libtool m4 pkg-config git wget curl
+  bison flex tar xz unzip zip
+)
+
+# Global auto-prompt behavior (set by -Y / -N commands)
+AUTO_Y=0
+AUTO_N=0
+
+# Force tree refresh threshold (seconds)
+TREE_MAX_AGE=86400   # 24 hours
+
+# Where the upgrade scan results go
+UPG_LAST_FILE="/tmp/easysbo-upgrades.last"  # latest completed scan (human-readable)
+UPG_TMP_FILE="/tmp/easysbo-upgrades.$$"     # scratch file during this run
+
+#===============================================================================
+# LEFTOVER CLEANUP (Ctrl-C debris, stale temps)
+#===============================================================================
+cleanup_leftovers(){
+  find /tmp -maxdepth 1 -type f -name 'easysbo-upgrades.*' ! -name 'easysbo-upgrades.last' \
+       -mmin +5 -print -delete 2>/dev/null | sed 's/^/==> Removing stale scan temp: /'
+  if [[ -d "$BUILDROOT" ]]; then
+    find "$BUILDROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null \
+      | while IFS= read -r -d '' d; do
+          if [[ -f "$d/.easysbo-building" ]]; then
+            echo "==> Cleaning interrupted build dir: $d"
+            rm -rf "$d"
+          fi
+        done
+  fi
+  find /tmp -maxdepth 1 -type f -name '*-error.log' -size 0 -print -delete 2>/dev/null \
+    | sed 's/^/==> Removing empty error log: /'
+}
+
+#===============================================================================
+# DETECTION & PATHS
+#===============================================================================
+
+msg(){ echo "==> $*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "run as root"; }
+
+ensure_dirs(){
+  install -d -m 0755 "$WORKDIR" "$SBO_PARENT" "$BUILDROOT" "$SRCROOT"
+  install -d -m 0755 "$TMPROOT" "$OUTBASE"
+}
+
+arch_token() {
+  case "$(uname -m)" in
+    x86_64)  echo "x86_64" ;;
+    i?86)    echo "i586" ;;
+    aarch64) echo "aarch64" ;;
+    armv7l|armv6l|arm*) echo "arm" ;;
+    *)       echo "$(uname -m)" ;;
+  esac
+}
+
+slack_branch_raw() {
+  if [[ -f /etc/slackware-version ]]; then
+    awk '{print $2}' /etc/slackware-version
+    return
+  fi
+  echo "current"
+}
+
+discover_latest_stable_branch() {
+  local out candidates=""
+  if command -v rsync >/dev/null 2>&1; then
+    if out=$(rsync --list-only "$SBO_RSYNC_PRIMARY/" 2>/dev/null); then
+      candidates+=$'\n'"$(echo "$out" | awk '{print $NF}' | grep -E '^[0-9]+\.[0-9]+/?$' | sed 's#/$##')"
+    fi
+    if out=$(rsync --list-only "$SBO_RSYNC_FALLBACK/" 2>/dev/null); then
+      candidates+=$'\n'"$(echo "$out" | awk '{print $NF}' | grep -E '^[0-9]+\.[0-9]+/?$' | sed 's#/$##')"
+    fi
+  fi
+  if [[ -z "${candidates//[$'\n ']/}" ]] && command -v git >/dev/null 2>&1; then
+    if out=$(git ls-remote --heads "$SBO_GIT_URL" 2>/dev/null); then
+      candidates+=$'\n'"$(echo "$out" | awk -F'refs/heads/' '/refs\/heads\//{print $2}' | grep -E '^[0-9]+\.[0-9]+$')"
+    fi
+  fi
+  candidates=$(echo "$candidates" | sed '/^\s*$/d' | sort -Vu | tr '\n' ' ')
+  [[ -n "$candidates" ]] && { echo "$candidates" | awk '{print $NF}'; return; }
+  echo "$LATEST_STABLE_FALLBACK"
+}
+
+resolve_sbo_branch_for_system() {
+  local sys; sys="$(slack_branch_raw)"
+  case "$sys" in
+    current|Current)
+      local latest; latest="$(discover_latest_stable_branch)"
+      msg "System is -current; using latest stable SBo branch: $latest"
+      echo "$latest"; return ;;
+  esac
+  if [[ "$sys" =~ ^([0-9]+)\.([0-9]+)\+$ ]]; then
+    echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; return
+  fi
+  if [[ "$sys" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "$sys"; return
+  fi
+  msg "Unrecognized Slackware version '$sys'; using fallback SBo branch: $LATEST_STABLE_FALLBACK"
+  echo "$LATEST_STABLE_FALLBACK"
+}
+
+stamp_file_for_branch(){ echo "$SBO_PARENT/$1/.easysbo-updated"; }
+
+tree_is_fresh(){
+  local branch="$1" tree="$SBO_PARENT/$branch" stamp; stamp="$(stamp_file_for_branch "$branch")"
+  [[ -d "$tree" ]] || return 1
+  [[ -f "$stamp" ]] || return 1
+  local now ts age
+  now=$(date +%s)
+  if ts=$(stat -c %Y "$stamp" 2>/dev/null); then :; else ts=$(date -r "$stamp" +%s); fi
+  age=$(( now - ts ))
+  (( age <= TREE_MAX_AGE ))
+}
+
+ensure_fresh_tree_before_action(){
+  local branch="$1" dry="${2:-0}"
+  if [[ "$dry" -eq 1 ]]; then
+    local tree="$SBO_PARENT/$branch"
+    if [[ ! -d "$tree" ]]; then
+      msg "NOTE: SBo tree for '$branch' not found; dry-run may use stale/missing data. Run -update for accuracy."
+    elif ! tree_is_fresh "$branch"; then
+      msg "NOTE: SBo tree for '$branch' is older than 24h; dry-run will use stale data. Run -update for freshness."
+    fi
+    return 0
+  fi
+  if ! tree_is_fresh "$branch"; then
+    msg "SBo tree for '$branch' is older than 24h (or missing). Running -update first…"
+    cmd_update_internal "$branch"
+  fi
+}
+
+# Remove old /tmp/*-error.log files older than 24h on each run
+cleanup_old_error_logs(){
+  local maxmin=$(( TREE_MAX_AGE / 60 ))
+  find /tmp -maxdepth 1 -type f -name '*-error.log' -mmin +$maxmin -print -delete 2>/dev/null \
+    | sed 's/^/==> Removing old error log: /'
+}
+
+# On exit, restore cursor & clean tmp
+cleanup_tmp(){
+  tput cnorm 2>/dev/null || true
+  [[ -f "$UPG_TMP_FILE" ]] && rm -f "$UPG_TMP_FILE"
+  [[ -f "$RUN_MARKER" ]] && rm -f "$RUN_MARKER"
+}
+trap cleanup_tmp EXIT
+
+#===============================================================================
+# BUILD INFORMATION (per-run constants)
+#===============================================================================
+BUILDDATE="$(date -u +'%a %b %d %T UTC %Y')"
+SLACKVERSION="$(cat /etc/slackware-version 2>/dev/null || echo 'unknown')"
+KERNEL="$(uname -r)"
+
+# Marker for this run (used to detect new error logs)
+RUN_MARKER="/tmp/.easysbo-run.$$"
+
+#===============================================================================
+# VERSION & PACKAGE PARSING HELPERS
+#===============================================================================
+ver_gt(){ [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]; }
+ver_lt(){ [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$1" ]]; }
+
+parse_pkg_record(){
+  local base="$1"
+  IFS='-' read -r -a F <<<"$base"
+  local n=${#F[@]}
+  if (( n < 4 )); then echo "$base|||"; return; fi
+  local build="${F[$((n-1))]}"
+  local arch="${F[$((n-2))]}"
+  local version="${F[$((n-3))]}"
+  local i name_parts=()
+  for (( i=0; i<=n-4; i++ )); do name_parts+=("${F[$i]}"); done
+  local name="${name_parts[*]}"; name="${name// /-}"
+  echo "${name}|${version}|${arch}|${build}"
+}
+
+#===============================================================================
+# UTILS — prompts, .info handling, deps, fetching, patching, building
+#===============================================================================
+prompt_yes(){
+  local prompt="$1"
+  if [[ "$AUTO_N" -eq 1 ]]; then echo "n"; return 1; fi
+  if [[ "$AUTO_Y" -eq 1 ]]; then echo "Y"; return 0; fi
+  local ans; read -r -p "$prompt" ans
+  ans="${ans:-Y}"
+  case "$ans" in Y|y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+find_info(){ local pkg="$1" tree="$2"; local f; f=$(find "$tree" -type f -name "${pkg}.info" -print -quit); [[ -n "$f" ]] && echo "$f"; }
+
+parse_requires(){
+  local info="$1"
+  local line; line=$(sed -n 's/^REQUIRES="\([^"]*\)".*/\1/p' "$info" | head -n1 || true)
+  echo "$line" | tr '\t' ' ' | sed 's/[|,]/ /g;s/%README%//g' | xargs || true
+}
+
+info_get_var(){
+  local info="$1" var="$2"
+  awk -v k="${var}=" '
+    BEGIN{RS=""; FS="\n"}
+    {for(i=1;i<=NF;i++){line=$i;gsub(/\r/,"",line);if(line~"^"k"\""){v=substr(line,index(line,"\"")+1);while(v!~/"$/){i++;if(i>NF)break;more=$i;gsub(/\r/,"",more);v=v"\n"more}sub(/"$/,"",v);print v;exit}}}
+  ' "$info"
+}
+
+info_get_download_sets(){
+  local info="$1" arch; arch="$(arch_token)"
+  local u m urls md5s
+  case "$arch" in
+    x86_64)  u="$(info_get_var "$info" 'DOWNLOAD_x86_64')"; m="$(info_get_var "$info" 'MD5SUM_x86_64')" ;;
+    i586)    u="$(info_get_var "$info" 'DOWNLOAD_x86')";    m="$(info_get_var "$info" 'MD5SUM_x86')" ;;
+    aarch64) u="$(info_get_var "$info" 'DOWNLOAD_aarch64')"; m="$(info_get_var "$info" 'MD5SUM_aarch64')" ;;
+    arm)     u="$(info_get_var "$info" 'DOWNLOAD_arm')";    m="$(info_get_var "$info" 'MD5SUM_arm')" ;;
+    *)       u=""; m="";;
+  esac
+  urls="$(printf "%s\n%s\n" "$u" "$(info_get_var "$info" 'DOWNLOAD')" | sed '/^[[:space:]]*$/d')"
+  md5s="$(printf "%s\n%s\n" "$m" "$(info_get_var "$info" 'MD5SUM')"   | sed '/^[[:space:]]*$/d')"
+
+  # Normalize
+  urls="$(echo "$urls" | tr ' \t' '\n' | sed '/^$/d;/^\\/d;/^[A-Za-z0-9._-]*$/d;/^[[:space:]]*$/d' | grep -E '^[a-z]+://')"
+  md5s="$(echo "$md5s" | tr ' \t' '\n' | sed '/^$/d')"
+
+  printf "%s\n--SEP--\n%s\n" "$urls" "$md5s"
+}
+
+is_installed(){ ls "/var/log/packages/${1}-"* >/dev/null 2>&1; }
+
+installed_version(){
+  local name="$1" rec base meta ver
+  rec=$(ls -1t /var/log/packages/${name}-* 2>/dev/null | head -n1 || true)
+  [[ -n "$rec" ]] || { echo ""; return 0; }
+  base="${rec##*/}"
+  meta="$(parse_pkg_record "$base")"
+  ver="${meta#*|}"; ver="${ver%%|*}"
+  echo "$ver"
+}
+
+is_base_pkg(){ local p="$1"; for b in "${BASE_PKGS_IGNORE[@]}"; do [[ "$p" == "$b" ]] && return 0; done; return 1; }
+
+fetch_with(){
+  local url="$1" dest="$2" errlog="${3:-}"
+  if command -v curl >/dev/null 2>&1; then
+    if [[ -n "$errlog" ]]; then
+      if ! curl -fL --retry 3 --retry-delay 2 -o "$dest" "$url" 2> >(tee -a "$errlog" >&2); then
+        rm -f "$dest"; echo "Fetch error for: $url" >>"$errlog"; die "Source fetch failed (HTTP/network) for: $url"
+      fi
+    else
+      if ! curl -fL --retry 3 --retry-delay 2 -o "$dest" "$url"; then
+        rm -f "$dest"; die "Source fetch failed (HTTP/network) for: $url"
+      fi
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if [[ -n "$errlog" ]]; then
+      if ! wget --tries=3 --retry-connrefused -O "$dest" "$url" 2> >(tee -a "$errlog" >&2); then
+        rm -f "$dest"; echo "Fetch error for: $url" >>"$errlog"; die "Source fetch failed for: $url"
+      fi
+    else
+      if ! wget --tries=3 --retry-connrefused -O "$dest" "$url"; then
+        rm -f "$dest"; die "Source fetch failed for: $url"
+      fi
+    fi
+  else
+    die "Neither curl nor wget available to fetch sources"
+  fi
+  [[ -s "$dest" ]] || { rm -f "$dest"; [[ -n "$errlog" ]] && echo "Downloaded file empty for: $url" >>"$errlog"; die "Downloaded file is empty for: $url"; }
+}
+
+md5_ok(){ local file="$1" want="$2"; [[ -f "$file" ]] || return 1; local got; got=$(md5sum "$file" | awk '{print $1}'); [[ "$got" == "$want" ]]; }
+
+download_sources(){
+  local pkg="$1" info="$2"
+  local joined urls md5s version errlog
+  version="$(info_get_var "$info" 'VERSION' | tr -d ' \t')"
+  joined="$(info_get_download_sets "$info")"
+  urls="$(echo "$joined" | awk '/--SEP--/ {p=0} !/--SEP--/ && !p {print} /--SEP--/ {p=1}')"
+  md5s="$(echo "$joined" | awk '/--SEP--/ {p=1; next} p {print}')"
+
+  if echo "$urls" | grep -q -E '(^|[[:space:]])UNSUPPORTED([[:space:]]|$)'; then
+    die "Package '$pkg' requires manual download (UNSUPPORTED). Put sources in $SRCROOT/$pkg/"
+  fi
+
+  if [[ -z "${urls//[[:space:]]/}" ]]; then
+    errlog="/tmp/${pkg}-error.log"; : > "$errlog"
+    echo "No valid DOWNLOAD URLs parsed from .info for $pkg" >>"$errlog"
+    echo "Errors occurred, please check $errlog"
+    die "No valid DOWNLOAD URLs found for $pkg"
+  fi
+
+  install -d "$SRCROOT/$pkg"
+  mapfile -t URLA < <(printf "%s\n" "$urls")
+  mapfile -t MD5A < <(printf "%s\n" "$md5s")
+
+  if [[ ${#MD5A[@]} -ne 0 && ${#MD5A[@]} -ne ${#URLA[@]} ]]; then
+    msg "MD5 count differs from DOWNLOAD count for $pkg; will verify where provided."
+  fi
+
+  local i; errlog="/tmp/${pkg}-error.log"
+  : > "$errlog"
+
+  local any_fetched=0
+  for i in "${!URLA[@]}"; do
+    local url base dest want
+    url="${URLA[$i]}"; [[ -n "$url" ]] || continue
+    base="${url##*/}"
+    dest="$SRCROOT/$pkg/$base"
+    want="${MD5A[$i]:-}"
+
+    if [[ -n "$want" ]] && [[ -f "$dest" ]] && md5_ok "$dest" "$want"; then
+      msg "Source OK (cached): $base"
+      any_fetched=1
+      continue
+    fi
+
+    msg "Fetching: $url"
+    fetch_with "$url" "$dest" "$errlog"
+
+    if [[ -n "$want" ]]; then
+      if ! md5_ok "$dest" "$want"; then
+        echo "MD5 mismatch for $base (expected $want)" >>"$errlog"
+        echo "Errors occurred, please check $errlog"
+        rm -f "$dest"; die "MD5 mismatch for $base in $pkg"
+      fi
+    else
+      if [[ -n "$version" ]] && ! echo "$base" | grep -q "$version"; then
+        echo "Wrong version file for $pkg: expected contains VERSION='$version', got '$base'" >>"$errlog"
+        echo "Errors occurred, please check $errlog"
+        rm -f "$dest"; die "Wrong version for $pkg: $base"
+      fi
+    fi
+
+    [[ -s "$dest" ]] || { echo "Downloaded empty file: $base" >>"$errlog"; echo "Errors occurred, please check $errlog"; rm -f "$dest"; die "Source file missing or empty after download: $base"; }
+    any_fetched=1
+  done
+
+  if [[ -f "$errlog" && ! -s "$errlog" ]]; then rm -f "$errlog"; fi
+  [[ $any_fetched -ge 0 ]] || true
+}
+
+copy_recipe_tree(){
+  local info="$1" builddir="$2" srcdir
+  srcdir="${info%/*}"; [[ "$srcdir" == "$info" ]] && srcdir="."
+  rm -rf "$builddir"; mkdir -p "$builddir"
+  (cd "$srcdir" && tar -cf - .) | (cd "$builddir" && tar -xf -)
+}
+
+inject_error_tee(){
+  local pkg="$1" sb="$2" inj="$2.sbomgr.inj" tmpf="$2.sbomgr.new"
+  local errlog="/tmp/${pkg}-error.log"
+  cat > "$inj" <<EOF
+# --- easysbo injection: tee build stderr to $errlog ---
+cmake() { command cmake "\$@" 2> >(tee -a "$errlog" >&2); }
+make()  { command make  "\$@"  2> >(tee -a "$errlog" >&2); }
+ninja() { command ninja "\$@" 2> >(tee -a "$errlog" >&2); }
+# --- end easysbo injection ---
+EOF
+  { head -n 1 "$sb"; cat "$inj"; tail -n +2 "$sb"; } > "$tmpf"
+  touch -r "$sb" "$tmpf"
+  mv -f "$tmpf" "$sb"; rm -f "$inj"
+}
+
+augment_slack_desc(){
+  local pkg="$1" builddir="$2" sdesc block tmp
+  sdesc="$builddir/slack-desc"
+  [[ -f "$sdesc" ]] || return 0
+  block=$'# Build information\n'"#  Built on: ${BUILDDATE}\n#  Slackware: ${SLACKVERSION}\n#  Kernel: ${KERNEL}\n"
+  if grep -q '^# Package metadata' "$sdesc"; then
+    tmp="${sdesc}.easysbo.tmp"
+    awk -v blk="$block" '
+      BEGIN{added=0}
+      {print $0}
+      /^# Package metadata/ && !added { print blk; added=1 }
+      END{ if(!added) print blk }
+    ' "$sdesc" > "$tmp" && mv -f "$tmp" "$sdesc"
+  else
+    printf "\n%s" "$block" >> "$sdesc"
+  fi
+}
+
+report_nonempty_error_logs_since_marker(){
+  local found=0
+  while IFS= read -r -d '' f; do
+    if [[ -s "$f" ]]; then
+      echo "Errors occurred, please check $f"
+      found=1
+    fi
+  done < <(find /tmp -maxdepth 1 -type f -name '*-error.log' -newer "$RUN_MARKER" -print0 2>/dev/null)
+  return $found
+}
+
+run_slackbuild(){
+  local pkg="$1" builddir="$2"
+  local sb errlog outpkg rc
+  sb="$(find "$builddir" -maxdepth 1 -type f -name "*.SlackBuild" | head -n1)" || true
+  [[ -n "$sb" ]] || die "No *.SlackBuild found for $pkg"
+  : > "$builddir/.easysbo-building"
+  errlog="/tmp/${pkg}-error.log"; : > "$errlog"
+  augment_slack_desc "$pkg" "$builddir"
+  inject_error_tee "$pkg" "$sb"
+  chmod +x "$sb"
+  export ARCH="$(arch_token)"
+  export TMP="$TMPROOT"
+  export OUTPUT="$OUTBASE/$pkg"
+  install -d "$OUTPUT"
+  if [[ -d "$SRCROOT/$pkg" ]]; then
+    (cd "$SRCROOT/$pkg" && for f in *; do [[ -f "$f" ]] && ln -sf "$PWD/$f" "$builddir/$f"; done)
+  fi
+  msg "Building $pkg (ARCH=$ARCH)…"
+  set +e
+  ( cd "$builddir" && /bin/bash "$sb" )
+  rc=$?
+  set -e
+  rm -f "$builddir/.easysbo-building" 2>/dev/null || true
+  if [[ $rc -ne 0 ]]; then
+    msg "Build FAILED for $pkg (see $errlog)"
+    return $rc
+  fi
+  [[ -f "$errlog" ]] && rm -f "$errlog"
+  local try=0
+  while (( try < 3 )); do
+    outpkg=$(ls -1t "$OUTPUT"/${pkg}-*.t?z 2>/dev/null | head -n1 || true)
+    [[ -n "$outpkg" && -f "$outpkg" ]] && break
+    sleep 1; try=$((try+1))
+  done
+  outpkg="${outpkg%$'\r'}"
+  [[ -n "$outpkg" && -f "$outpkg" ]] || die "Build succeeded but no package found in $OUTPUT"
+  echo "$outpkg"
+}
+
+#===============================================================================
+# POST-UPGRADE CLEANUP & INSTALL/UPGRADE
+#===============================================================================
+post_upgrade_cleanup(){
+  local name="$1"
+  local matches=()
+  mapfile -t matches < <(ls -1 /var/log/packages/${name}-* 2>/dev/null || true)
+  (( ${#matches[@]} <= 1 )) && return 0
+  local lines=() m base meta ver
+  for m in "${matches[@]}"; do
+    base="${m##*/}"
+    meta="$(parse_pkg_record "$base")"
+    ver="${meta#*|}"; ver="${ver%%|*}"
+    lines+=( "${ver}|${m}" )
+  done
+  IFS=$'\n' lines=($(printf '%s\n' "${lines[@]}" | sort -t'|' -k1,1V ))
+  local keep="${lines[-1]#*|}"
+  local drop=("${lines[@]:0:${#lines[@]}-1}")
+  if (( ${#drop[@]} > 0 )); then
+    echo "Multiple ${name} entries detected. Keeping: ${keep##*/}"
+    local d rec
+    for d in "${drop[@]}"; do
+      rec="${d#*|}"
+      if prompt_yes "Remove older ${name} entry $(basename "$rec") ? Y/n "; then
+        removepkg "$(basename "$rec")"
+      else
+        msg "Left older ${name} entry in place: $(basename "$rec")"
+      fi
+    done
+  fi
+}
+
+install_or_upgrade_pkg(){
+  local mode="$1" pkgfile="$2" name="$3"
+  pkgfile="${pkgfile%$'\r'}"
+  if [[ ! -f "$pkgfile" ]]; then
+    local dir guess
+    dir="${pkgfile%/*}"; [[ "$dir" == "$pkgfile" ]] && dir="."
+    guess=$(ls -1t "$dir"/"${name}"-*.t?z 2>/dev/null | head -n1 || true)
+    [[ -z "$guess" ]] && guess=$(ls -1t "$OUTBASE"/"$name"/"${name}"-*.t?z 2>/dev/null | head -n1 || true)
+    if [[ -n "$guess" && -f "$guess" ]]; then pkgfile="$guess"; fi
+  fi
+  [[ -f "$pkgfile" ]] || die "Package file not found: $pkgfile"
+  case "$mode" in
+    install)
+      if is_installed "$name"; then
+        msg "$name already installed — switching to upgrade path"
+        upgradepkg --reinstall --install-new "$pkgfile" || die "upgradepkg failed for $pkgfile"
+        post_upgrade_cleanup "${name}"
+      else
+        msg "Installing: $pkgfile"
+        installpkg "$pkgfile"
+      fi
+      ;;
+    upgrade)
+      msg "Upgrading (replacing if same version): $pkgfile"
+      upgradepkg --reinstall --install-new "$pkgfile" || die "upgradepkg failed for $pkgfile"
+      post_upgrade_cleanup "${name}"
+      ;;
+    *)
+      die "Unknown mode: $mode"
+      ;;
+  esac
+}
+
+#===============================================================================
+# DEPENDENCY RESOLUTION
+#===============================================================================
+declare -A VISITING VISITED
+RESOLVED=()
+
+resolve_pkg(){
+  local pkg="$1" tree="$2" info deps dep
+  [[ -n "${VISITED[$pkg]:-}" ]] && return 0
+  [[ -n "${VISITING[$pkg]:-}" ]] && die "Dependency cycle detected involving '$pkg'"
+  info=$(find_info "$pkg" "$tree") || die "Package '$pkg' not found in SBo tree ($tree)"
+  VISITING["$pkg"]=1
+  deps=$(parse_requires "$info")
+  for dep in $deps; do [[ -n "$dep" ]] && resolve_pkg "$dep" "$tree"; done
+  VISITING["$pkg"]=""
+  VISITED["$pkg"]=1
+  RESOLVED+=("$pkg")
+}
+
+deps_missing_excluding_target(){
+  local target="$1" out=() p
+  for p in "${RESOLVED[@]}"; do
+    [[ "$p" == "$target" ]] && continue
+    if ! is_base_pkg "$p" && ! is_installed "$p"; then out+=("$p"); fi
+  done
+  [[ ${#out[@]} -gt 0 ]] && printf '%s\n' "${out[@]}"
+}
+
+#===============================================================================
+# DRY RUN PLANNERS
+#===============================================================================
+plan_install_print(){
+  local target="$1" to_install=() p
+  for p in "${RESOLVED[@]}"; do
+    [[ "$p" == "$target" ]] && continue
+    if ! is_base_pkg "$p" && ! is_installed "$p"; then to_install+=("$p"); fi
+  done
+  if ! is_installed "$target"; then to_install+=("$target"); fi
+  if [[ ${#to_install[@]} -eq 0 ]]; then
+    echo "Dry-run: nothing to install; all requirements (and target) already present."
+  else
+    echo "Dry-run plan (install in this order):"
+    for p in "${to_install[@]}"; do echo "  - $p"; done
+  fi
+}
+
+plan_upgrade_print(){
+  local target="$1" tree="$2" missing=() upgradable=()
+  for p in "${RESOLVED[@]}"; do
+    [[ "$p" == "$target" ]] && continue
+    if ! is_base_pkg "$p" && ! is_installed "$p"; then missing+=("$p"); fi
+  done
+  for p in "${RESOLVED[@]}"; do
+    [[ "$p" == "$target" ]] && continue
+    if is_base_pkg "$p" || ! is_installed "$p"; then continue; fi
+    local info inst_ver info_ver
+    info=$(find_info "$p" "$tree") || continue
+    info_ver="$(info_get_var "$info" 'VERSION' | tr -d ' \t')"
+    inst_ver="$(installed_version "$p")"
+    if [[ -n "$info_ver" && -n "$inst_ver" ]] && ver_gt "$info_ver" "$inst_ver"; then
+      upgradable+=("$p $inst_ver -> $info_ver")
+    fi
+  done
+  echo "Dry-run plan:"
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "  Install missing deps:"; for p in "${missing[@]}"; do echo "    - $p"; done
+  else
+    echo "  No missing deps to install."
+  fi
+  if [[ ${#upgradable[@]} -gt 0 ]]; then
+    echo "  Offer upgrades for installed deps:"; for line in "${upgradable[@]}"; do echo "    - $line"; done
+  else
+    echo "  No installed deps need upgrade."
+  fi
+  local t_info t_inst t_info_ver
+  t_info=$(find_info "$target" "$tree") || { echo "  Target '$target' not found in SBo tree."; return 0; }
+  t_info_ver="$(info_get_var "$t_info" 'VERSION' | tr -d ' \t')"
+  t_inst="$(installed_version "$target")"
+  if [[ -n "$t_inst" && -n "$t_info_ver" ]]; then
+    if ver_gt "$t_info_ver" "$t_inst"; then
+      echo "  Upgrade target: $target $t_inst -> $t_info_ver"
+    else
+      echo "  Rebuild/keep target: $target (installed $t_inst; SBo $t_info_ver)"
+    fi
+  else
+    echo "  Install target: $target (not installed)"
+  fi
+}
+
+#===============================================================================
+# LIST
+#===============================================================================
+is_sbo_buildtag(){ local b="$1"; [[ "$b" =~ [Ss][Bb][Oo] ]]; }
+
+cmd_list_sbo(){
+  shopt -s nullglob
+  local rec base meta name ver arch build
+  for rec in /var/log/packages/*; do
+    base="${rec##*/}"
+    meta="$(parse_pkg_record "$base")"
+    name="${meta%%|*}"; meta="${meta#*|}"
+    ver="${meta%%|*}";  meta="${meta#*|}"
+    arch="${meta%%|*}"; build="${meta#*|}"
+    if is_sbo_buildtag "$build"; then
+      printf "%-35s %s  (%s, %s)\n" "$name" "$ver" "$arch" "$build"
+    fi
+  done
+}
+
+cmd_list_non_sbo(){
+  shopt -s nullglob
+  local rec base meta name ver arch build
+  for rec in /var/log/packages/*; do
+    base="${rec##*/}"
+    meta="$(parse_pkg_record "$base")"
+    name="${meta%%|*}"; meta="${meta#*|}"
+    ver="${meta%%|*}";  meta="${meta#*|}"
+    arch="${meta%%|*}"; build="${meta#*|}"
+    if ! is_sbo_buildtag "$build"; then
+      printf "%-35s %s  (%s, %s)\n" "$name" "$ver" "$arch" "$build"
+    fi
+  done
+}
+
+cmd_list_available(){
+  local BRANCH; BRANCH="$(resolve_sbo_branch_for_system)"
+  ensure_fresh_tree_before_action "$BRANCH" 0
+  local tree="$SBO_PARENT/$BRANCH"
+  [[ -d "$tree" ]] || die "SBo tree not found at $tree. Run: $0 -update"
+  find "$tree" -type f -name '*.info' \
+    | LC_ALL=C sort \
+    | while read -r info; do
+        local pkg ver rel cat
+        pkg="$(basename "${info%.info}")"
+        ver="$(info_get_var "$info" 'VERSION' | tr -d ' \t')"
+        rel="${info#$tree/}"; cat="${rel%%/*}"
+        printf "%-35s %s  [category: %s]\n" "$pkg" "${ver:-?}" "$cat"
+      done
+}
+
+#===============================================================================
+# UPDATE
+#===============================================================================
+cmd_update_internal(){
+  local BRANCH="$1"
+  ensure_dirs
+  local tree="$SBO_PARENT/$BRANCH"
+  install -d "$tree"
+  msg "Updating SBo tree for branch '$BRANCH' → $tree"
+
+  if command -v rsync >/dev/null 2>&1; then
+    set +e
+    rsync -a --info=progress2 --delete --delete-excluded --exclude '.git/' \
+      "${SBO_RSYNC_PRIMARY}/${BRANCH}/" "$tree/"
+    local rc=$?
+    set -e
+    if [[ $rc -ne 0 ]]; then
+      msg "Primary rsync failed (rc=$rc). Trying fallback…"
+      rsync -a --info=progress2 --delete --delete-excluded --exclude '.git/' \
+        "${SBO_RSYNC_FALLBACK}/${BRANCH}/" "$tree/" \
+        || die "rsync failed for both primary and fallback"
+    fi
+    touch "$(stamp_file_for_branch "$BRANCH")"
+    msg "SBo tree updated."
+  elif command -v git >/dev/null 2>&1; then
+    if [[ -d "$tree/.git" ]]; then
+      (cd "$tree" && git fetch --all --progress && git checkout "$BRANCH" && git reset --hard "origin/$BRANCH")
+    else
+      rm -rf "$tree"
+      git clone --progress --branch "$BRANCH" --depth 1 "$SBO_GIT_URL" "$tree"
+    fi
+    touch "$(stamp_file_for_branch "$BRANCH")"
+    msg "SBo tree updated (git)."
+  else
+    die "Need rsync or git to update SBo tree."
+  fi
+}
+
+cmd_update(){ local BRANCH; BRANCH="$(resolve_sbo_branch_for_system)"; cmd_update_internal "$BRANCH"; }
+
+#===============================================================================
+# SCAN FOR UPGRADES (progress + file output)
+#===============================================================================
+sbo_upgradable_scan(){
+  local tree="$1" outfile="$2"
+  : > "$outfile"
+  local total
+  total=$(find "$tree" -type f -name '*.info' 2>/dev/null | wc -l | awk '{print $1}')
+  if [[ -z "$total" || "$total" -eq 0 ]]; then
+    msg "No .info files found in SBo tree at $tree. Is the tree populated?"
+    return 0
+  fi
+  local i=0 lastpct=-1 start_ts; start_ts=$(date +%s)
+  [[ -t 1 ]] && tput civis 2>/dev/null || true
+  set +e
+  find "$tree" -type f -name '*.info' -print0 2>/dev/null | sort -z | \
+  while IFS= read -r -d '' info; do
+    i=$((i+1))
+    if [[ -t 1 ]]; then
+      local pct=$(( i * 100 / total ))
+      if (( pct != lastpct )); then
+        printf "\rScanning: %d/%d (%d%%)…" "$i" "$total" "$pct"
+        lastpct=$pct
+      fi
+    fi
+    local pkg inst_ver info_ver
+    pkg="$(basename "${info%.info}")"
+    is_base_pkg "$pkg" && continue
+    inst_ver="$(installed_version "$pkg")"
+    [[ -z "$inst_ver" ]] && continue
+    info_ver="$(info_get_var "$info" 'VERSION' | tr -d ' \t')"
+    [[ -z "$info_ver" ]] && continue
+    if ver_gt "$info_ver" "$inst_ver"; then
+      printf '%s|%s|%s\n' "$pkg" "$inst_ver" "$info_ver" >> "$outfile"
+    fi
+  done
+  set -e
+  [[ -t 1 ]] && { printf "\rScanning: %d/%d (100%%)… done.\n" "$i" "$total"; tput cnorm 2>/dev/null || true; }
+  msg "Upgrade scan complete in $(( $(date +%s) - start_ts ))s. Results: $outfile"
+  cp -f "$outfile" "$UPG_LAST_FILE" 2>/dev/null || true
+}
+
+#===============================================================================
+# LOCAL SLACKBUILD TARBALL SUPPORT
+#===============================================================================
+tar_to_abs(){
+  local arg="$1"
+  # If the user gave a path, use it as-is.
+  if [[ "$arg" == */* ]]; then
+    echo "$arg"
+    return
+  fi
+  # No path component: prefer ./arg if it exists; else fall back to $HOME/arg.
+  if [[ -f "./$arg" ]]; then
+    echo "./$arg"
+  else
+    echo "$HOME/$arg"
+  fi
+}
+
+extract_slackbuild_tar(){
+  local tarball="$1" stage="$2"
+  rm -rf "$stage"; mkdir -p "$stage"
+  tar -xf "$tarball" -C "$stage"
+}
+
+pkgname_from_builddir(){
+  local dir="$1" info sb
+  info="$(find "$dir" -maxdepth 1 -type f -name '*.info' | head -n1 || true)"
+  if [[ -n "$info" ]]; then
+    local p; p="$(sed -n 's/^PRGNAM="\?\([^"]*\)"\?.*/\1/p' "$info" | head -n1 || true)"
+    [[ -n "$p" ]] && { echo "$p"; return; }
+  fi
+  sb="$(find "$dir" -maxdepth 1 -type f -name '*.SlackBuild' | head -n1 || true)"
+  if [[ -n "$sb" ]]; then
+    echo "$(basename "${sb%.SlackBuild}")"; return
+  fi
+  echo "$(basename "$dir")"
+}
+
+prepare_local_target(){
+  local tarball="$1"
+  local stage="$BUILDROOT/.local-stage-$$"
+  extract_slackbuild_tar "$tarball" "$stage"
+  local root="$stage"
+  local sub
+  sub="$(find "$stage" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
+  [[ -n "$sub" ]] && root="$sub"
+  local pkg; pkg="$(pkgname_from_builddir "$root")"
+  local final="$BUILDROOT/$pkg"
+  rm -rf "$final"; mkdir -p "$final"
+  (cd "$root" && tar -cf - .) | (cd "$final" && tar -xf -)
+  rm -rf "$stage"
+  local info="$(find "$final" -maxdepth 1 -type f -name '*.info' | head -n1 || true)"
+  echo "$pkg|$final|$info"
+}
+
+#===============================================================================
+# INSTALL (tree-based or local --sb)
+#===============================================================================
+prompt_missing_deps_once(){
+  local target="$1"
+  mapfile -t miss < <(deps_missing_excluding_target "$target")
+  local filtered=() x
+  for x in "${miss[@]:-}"; do [[ -n "$x" ]] && filtered+=("$x"); done
+  [[ ${#filtered[@]} -eq 0 ]] && return 0
+  echo
+  echo "Missing REQUIRED packages:"
+  for x in "${filtered[@]}"; do echo "  - $x"; done
+  echo
+  if prompt_yes "${#filtered[@]} packages are missing. Continue? <Y/n> "; then
+    return 0
+  else
+    die "Aborted by user."
+  fi
+}
+
+cmd_install(){
+  local arg1="${1:-}"
+  local DRYRUN=0
+  if [[ "$arg1" == "--dryrun" ]]; then DRYRUN=1; shift; arg1="${1:-}"; fi
+
+  # Local SlackBuild tarball mode
+  if [[ "$arg1" == "--sb" ]]; then
+    shift
+    local tararg="${1:-}"; [[ -n "$tararg" ]] || die "Usage: $0 -install --sb <SlackBuild>.tar.*"
+    local tarball; tarball="$(tar_to_abs "$tararg")"
+    [[ -f "$tarball" ]] || die "SlackBuild tarball not found: $tarball"
+
+    ensure_dirs
+    local BRANCH; BRANCH="$(resolve_sbo_branch_for_system)"
+    ensure_fresh_tree_before_action "$BRANCH" "$DRYRUN"
+    local tree="$SBO_PARENT/$BRANCH"
+    [[ -d "$tree" ]] || die "SBo tree not found at $tree. Run: $0 -update"
+
+    local prep pkg builddir info
+    prep="$(prepare_local_target "$tarball")"
+    pkg="${prep%%|*}"; prep="${prep#*|}"
+    builddir="${prep%%|*}"; info="${prep#*|}"
+
+    VISITING=(); VISITED=(); RESOLVED=()
+    if [[ -n "$info" ]]; then
+      local dep; for dep in $(parse_requires "$info"); do [[ -n "$dep" ]] && resolve_pkg "$dep" "$tree"; done
+    fi
+    RESOLVED+=("$pkg")
+
+    echo; msg "Build order (deps first):"
+    for p in "${RESOLVED[@]}"; do if is_installed "$p"; then echo "  - $p (installed)"; else echo "  - $p"; fi; done; echo
+
+    if [[ "$DRYRUN" -eq 1 ]]; then
+      plan_install_print "$pkg"
+      return 0
+    fi
+
+    prompt_missing_deps_once "$pkg"
+
+    # Build deps from tree
+    for p in "${RESOLVED[@]}"; do
+      [[ "$p" == "$pkg" ]] && continue
+      if is_base_pkg "$p" || is_installed "$p"; then continue; fi
+      local di bd op
+      di=$(find_info "$p" "$tree") || die "Missing .info for $p"
+      bd="$BUILDROOT/$p"
+      msg "Preparing $p"
+      copy_recipe_tree "$di" "$bd"
+      download_sources "$p" "$di"
+      op=$(run_slackbuild "$p" "$bd")
+      install_or_upgrade_pkg "install" "$op" "$p"
+    done
+
+    # Build target from local tar dir, use its info if present for sources
+    if [[ -n "$info" ]]; then
+      msg "Preparing $pkg (local SlackBuild)"
+      download_sources "$pkg" "$info"
+    else
+      msg "No .info found in local SlackBuild for $pkg — skipping source fetch step"
+    fi
+    local outpkg; outpkg=$(run_slackbuild "$pkg" "$builddir")
+    install_or_upgrade_pkg "install" "$outpkg" "$pkg"
+
+    report_nonempty_error_logs_since_marker
+    msg "Install complete."
+    return 0
+  fi
+
+  # Normal tree-based install
+  local target="$arg1"; [[ -n "$target" ]] || die "Usage: $0 [-Y|-N] -install [--dryrun] <packagename> | -install --sb <tar>"
+  ensure_dirs
+  local BRANCH; BRANCH="$(resolve_sbo_branch_for_system)"
+  ensure_fresh_tree_before_action "$BRANCH" "$DRYRUN"
+  local tree="$SBO_PARENT/$BRANCH"
+  [[ -d "$tree" ]] || die "SBo tree not found at $tree. Run: $0 -update"
+
+  VISITING=(); VISITED=(); RESOLVED=()
+  msg "Resolving dependencies for '$target' (branch '$BRANCH')…"
+  resolve_pkg "$target" "$tree"
+
+  echo; msg "Build order (deps first):"
+  for p in "${RESOLVED[@]}"; do if is_installed "$p"; then echo "  - $p (installed)"; else echo "  - $p"; fi; done; echo
+  if [[ "$DRYRUN" -eq 1 ]]; then plan_install_print "$target"; return 0; fi
+  prompt_missing_deps_once "$target"
+
+  for pkg in "${RESOLVED[@]}"; do
+    if is_base_pkg "$pkg" || is_installed "$pkg"; then continue; fi
+    local info builddir outpkg
+    info=$(find_info "$pkg" "$tree") || die "Missing .info for $pkg"
+    builddir="$BUILDROOT/$pkg"
+    msg "Preparing $pkg"
+    copy_recipe_tree "$info" "$builddir"
+    download_sources "$pkg" "$info"
+    outpkg=$(run_slackbuild "$pkg" "$builddir")
+    install_or_upgrade_pkg "install" "$outpkg" "$pkg"
+  done
+
+  report_nonempty_error_logs_since_marker
+  msg "Install complete."
+}
+
+#===============================================================================
+# UPGRADE (tree-based or local --sb)
+#===============================================================================
+upgrade_one(){
+  local target="$1" tree="$2"
+
+  VISITING=(); VISITED=(); RESOLVED=()
+  msg "Resolving dependencies for '$target'…"
+  resolve_pkg "$target" "$tree"
+
+  prompt_missing_deps_once "$target"
+
+  # Build any missing deps first
+  for pkg in "${RESOLVED[@]}"; do
+    [[ "$pkg" == "$target" ]] && continue
+    if is_base_pkg "$pkg" || is_installed "$pkg"; then continue; fi
+    local info builddir outpkg
+    info=$(find_info "$pkg" "$tree") || die "Missing .info for $pkg"
+    builddir="$BUILDROOT/$pkg"
+    msg "Preparing $pkg"
+    copy_recipe_tree "$info" "$builddir"
+    download_sources "$pkg" "$info"
+    outpkg=$(run_slackbuild "$pkg" "$builddir")
+    install_or_upgrade_pkg "install" "$outpkg" "$pkg"
+  done
+
+  # Offer upgrades for installed deps
+  for pkg in "${RESOLVED[@]}"; do
+    [[ "$pkg" == "$target" ]] && continue
+    if is_base_pkg "$pkg" || ! is_installed "$pkg"; then continue; fi
+    local info inst_ver info_ver
+    info=$(find_info "$pkg" "$tree") || die "Missing .info for $pkg"
+    info_ver="$(info_get_var "$info" 'VERSION' | tr -d ' \t')"
+    inst_ver="$(installed_version "$pkg")"
+    if [[ -n "$info_ver" && -n "$inst_ver" ]] && ver_gt "$info_ver" "$inst_ver"; then
+      if prompt_yes "Would you like to upgrade $pkg (installed $inst_ver → SBo $info_ver)? Y/n "; then
+        local builddir outpkg
+        builddir="$BUILDROOT/$pkg"
+        msg "Preparing $pkg (upgrade)"
+        copy_recipe_tree "$info" "$builddir"
+        download_sources "$pkg" "$info"
+        outpkg=$(run_slackbuild "$pkg" "$builddir")
+        install_or_upgrade_pkg "upgrade" "$outpkg" "$pkg"
+      else
+        msg "Skipping upgrade of $pkg"
+      fi
+    fi
+  done
+
+  # Finally the target
+  local info builddir outpkg t_inst t_info_ver
+  info=$(find_info "$target" "$tree") || die "Missing .info for $target"
+  t_info_ver="$(info_get_var "$info" 'VERSION' | tr -d ' \t')"
+  t_inst="$(installed_version "$target")"
+  builddir="$BUILDROOT/$target"
+
+  if [[ -n "$t_inst" && -n "$t_info_ver" ]]; then
+    if ver_gt "$t_info_ver" "$t_inst"; then
+      msg "Upgrading target $target ($t_inst → $t_info_ver)…"
+    else
+      msg "Rebuilding/keeping target $target (installed $t_inst; SBo $t_info_ver)…"
+    fi
+  else
+    msg "Building target $target…"
+  fi
+
+  copy_recipe_tree "$info" "$builddir"
+  download_sources "$target" "$info"
+  outpkg=$(run_slackbuild "$target" "$builddir")
+  install_or_upgrade_pkg "upgrade" "$outpkg" "$target"
+}
+
+cmd_upgrade(){
+  local arg1="${1:-}"
+  local DRYRUN=0
+  if [[ "$arg1" == "--dryrun" ]]; then DRYRUN=1; shift; arg1="${1:-}"; fi
+
+  # Local SlackBuild tarball mode
+  if [[ "$arg1" == "--sb" ]]; then
+    shift
+    local tararg="${1:-}"; [[ -n "$tararg" ]] || die "Usage: $0 -upgrade --sb <SlackBuild>.tar.*"
+    local tarball; tarball="$(tar_to_abs "$tararg")"
+    [[ -f "$tarball" ]] || die "SlackBuild tarball not found: $tarball"
+
+    ensure_dirs
+    local BRANCH; BRANCH="$(resolve_sbo_branch_for_system)"
+    ensure_fresh_tree_before_action "$BRANCH" "$DRYRUN"
+    local tree="$SBO_PARENT/$BRANCH"
+    [[ -d "$tree" ]] || die "SBo tree not found at $tree. Run: $0 -update"
+
+    local prep pkg builddir info
+    prep="$(prepare_local_target "$tarball")"
+    pkg="${prep%%|*}"; prep="${prep#*|}"
+    builddir="${prep%%|*}"; info="${prep#*|}"
+
+    VISITING=(); VISITED=(); RESOLVED=()
+    if [[ -n "$info" ]]; then
+      local dep; for dep in $(parse_requires "$info"); do [[ -n "$dep" ]] && resolve_pkg "$dep" "$tree"; done
+    fi
+    RESOLVED+=("$pkg")
+
+    echo; msg "Build order (deps first):"
+    for p in "${RESOLVED[@]}"; do if is_installed "$p"; then echo "  - $p (installed)"; else echo "  - $p"; fi; done; echo
+
+    if [[ "$DRYRUN" -eq 1 ]]; then
+      plan_upgrade_print "$pkg" "$tree"
+      return 0
+    fi
+
+    prompt_missing_deps_once "$pkg"
+
+    # Build deps from tree
+    for p in "${RESOLVED[@]}"; do
+      [[ "$p" == "$pkg" ]] && continue
+      if is_base_pkg "$p" || is_installed "$p"; then continue; fi
+      local di bd op
+      di=$(find_info "$p" "$tree") || die "Missing .info for $p"
+      bd="$BUILDROOT/$p"
+      msg "Preparing $p"
+      copy_recipe_tree "$di" "$bd"
+      download_sources "$p" "$di"
+      op=$(run_slackbuild "$p" "$bd")
+      install_or_upgrade_pkg "install" "$op" "$p"
+    done
+
+    # Target from local tar
+    if [[ -n "$info" ]]; then
+      local t_inst t_info_ver
+      t_inst="$(installed_version "$pkg")"
+      t_info_ver="$(info_get_var "$info" 'VERSION' | tr -d ' \t')"
+      if [[ -n "$t_inst" && -n "$t_info_ver" ]]; then
+        if ver_gt "$t_info_ver" "$t_inst"; then
+          msg "Upgrading target $pkg ($t_inst → $t_info_ver)…"
+        else
+          msg "Rebuilding/keeping target $pkg (installed $t_inst; local $t_info_ver)…"
+        fi
+      else
+        msg "Building target $pkg…"
+      fi
+      download_sources "$pkg" "$info"
+    else
+      msg "No .info found in local SlackBuild for $pkg — skipping source fetch step"
+    fi
+    local outpkg; outpkg=$(run_slackbuild "$pkg" "$builddir")
+    install_or_upgrade_pkg "upgrade" "$outpkg" "$pkg"
+
+    report_nonempty_error_logs_since_marker
+    msg "Upgrade complete."
+    return 0
+  fi
+
+  # Normal tree-based upgrade flow
+  ensure_dirs
+  local BRANCH; BRANCH="$(resolve_sbo_branch_for_system)"
+  ensure_fresh_tree_before_action "$BRANCH" "$DRYRUN"
+  local tree="$SBO_PARENT/$BRANCH"
+  [[ -d "$tree" ]] || die "SBo tree not found at $tree. Run: $0 -update"
+
+  local target="${arg1:-}"
+  if [[ -z "$target" ]]; then
+    msg "Scanning for upgradeable SBo packages (branch '$BRANCH')…"
+    sbo_upgradable_scan "$tree" "$UPG_TMP_FILE"
+    if [[ -s "$UPG_TMP_FILE" ]]; then
+      while IFS='|' read -r p old new; do
+        printf "%-35s %s -> %s\n" "$p" "$old" "$new"
+      done < "$UPG_TMP_FILE"
+    else
+      echo "No upgradeable SBo packages found."
+    fi
+    return 0
+  fi
+
+  if [[ "$DRYRUN" -eq 1 ]]; then
+    VISITING=(); VISITED=(); RESOLVED=()
+    msg "Resolving dependencies for '$target' (dry run)…"
+    resolve_pkg "$target" "$tree"
+    plan_upgrade_print "$target" "$tree"
+    return 0
+  fi
+
+  if [[ "$target" == "--all" ]]; then
+    msg "Scanning for upgradeable SBo packages (branch '$BRANCH')…"
+    sbo_upgradable_scan "$tree" "$UPG_TMP_FILE"
+    if [[ ! -s "$UPG_TMP_FILE" ]]; then
+      echo "No upgradeable SBo packages found."
+      return 0
+    fi
+    echo "Upgradeable packages:"
+    while IFS='|' read -r pkg old new; do
+      printf '  %s %s -> %s\n' "$pkg" "$old" "$new"
+    done < "$UPG_TMP_FILE"
+    echo
+    while IFS='|' read -r pkg _ _; do
+      upgrade_one "$pkg" "$tree"
+    done < "$UPG_TMP_FILE"
+    msg "All requested upgrades complete."
+    report_nonempty_error_logs_since_marker
+    return 0
+  fi
+
+  upgrade_one "$target" "$tree"
+  report_nonempty_error_logs_since_marker
+  msg "Upgrade complete."
+}
+
+#===============================================================================
+# CLI ENTRYPOINT
+#===============================================================================
+usage(){
+  cat <<EOF
+Usage:
+  Commands (single dash):
+    -update            Sync the SlackBuilds.org tree into $SBO_PARENT/<branch>.
+                       On Slackware -current, uses the latest stable SBo branch.
+    -install <pkg>     Resolve REQUIRES (recursive), build+install missing deps
+                       then the target, in dependency order (base pkgs ignored).
+    -install --dryrun <pkg>
+                       Show what would be installed (deps + target) in order,
+                       without updating, downloading, building, or installing.
+    -install --sb <SlackBuild>.tar.*   Install from a local SlackBuild tarball.
+                       If no path given, prefers ./file then \$HOME/file.
+    -upgrade           Scan with progress; list TRUE upgrades (SBo > installed).
+                       Results saved to: $UPG_LAST_FILE
+    -upgrade --all     Upgrade ALL upgradeable SBo packages (after a progress scan).
+    -upgrade <pkg>     Install missing deps, offer upgrades for installed deps,
+                       then upgrade/rebuild the target (no downgrades listed).
+    -upgrade --dryrun <pkg>
+                       Show what would be installed/upgraded for <pkg> only
+                       (missing deps, true upgradable deps, target), no changes.
+    -upgrade --sb <SlackBuild>.tar.*   Upgrade (or build) from local SlackBuild.
+                       If no path given, prefers ./file then \$HOME/file.
+    -list              List installed SBo packages (build tag contains 'SBo').
+    -list --nosbo      List installed non-SBo packages.
+    -list --available  List packages in the local SBo tree.
+                       (If the tree is older than 24h, it will update first.)
+    -Y                 Assume 'Yes' to all prompts.
+    -N                 Assume 'No' to all prompts (overrides -Y).
+    -help              Show this help.
+
+Output locations (sbopkg-like):
+  TMP:      $TMPROOT
+  Packages: $OUTBASE/<pkg>/*.t?z
+
+Notes:
+  * On start, leftover temps and old/empty error logs are cleaned.
+  * Tree freshness: before -install/-upgrade, if the local SBo tree is >24h old,
+    an automatic -update is performed (except during --dryrun). Stamp:
+    \$SBO_PARENT/<branch>/.easysbo-updated
+  * Upgrade scans show a live progress line and write results to a temp file,
+    then display them. Last results copied to: $UPG_LAST_FILE
+  * Strict source checks: HTTP errors, empties, MD5 mismatches fail the run.
+  * If no MD5s, filenames must contain VERSION from .info; otherwise fail.
+  * 'UNSUPPORTED' downloads cause an immediate error (manual fetch required).
+  * On successful build, /tmp/<pkg>-error.log is removed; on failure it remains,
+    and a summary line is printed after the command ends.
+  * Each package’s slack_desc gains a "# Build information" block with:
+      Built on (UTC), Slackware version, Kernel.
+EOF
+}
+
+consume_yn_commands(){
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -Y) AUTO_Y=1; AUTO_N=0; shift ;;
+      -N) AUTO_Y=0; AUTO_N=1; shift ;;
+      *) break ;;
+    esac
+  done
+  printf '%s\n' "$AUTO_Y:$AUTO_N:$*"
+}
+
+main(){
+  need_root
+  ensure_dirs
+  cleanup_leftovers
+  cleanup_old_error_logs
+  : > "$RUN_MARKER"
+
+  [[ $# -ge 1 ]] || { usage; exit 1; }
+
+  local out rest
+  out="$(consume_yn_commands "$@")"
+  AUTO_Y="${out%%:*}"; out="${out#*:}"
+  AUTO_N="${out%%:*}"; out="${out#*:}"
+  rest="$out"
+  set -- $rest
+
+  case "${1:-}" in
+    -help) usage ;;
+    -Y|-N) : ;;
+    -update)
+      shift; out="$(consume_yn_commands "$@")"
+      AUTO_Y="${out%%:*}"; out="${out#*:}"; AUTO_N="${out%%:*}"; out="${out#*:}"
+      set -- $out; cmd_update ;;
+    -install)
+      shift; out="$(consume_yn_commands "$@")"
+      AUTO_Y="${out%%:*}"; out="${out#*:}"; AUTO_N="${out%%:*}"; out="${out#*:}"
+      set -- $out; cmd_install "${1:-}" "${2:-}" ;;
+    -upgrade)
+      shift; out="$(consume_yn_commands "$@")"
+      AUTO_Y="${out%%:*}"; out="${out#*:}"; AUTO_N="${out%%:*}"; out="${out#*:}"
+      set -- $out; cmd_upgrade "${1:-}" "${2:-}" ;;
+    -list)
+      shift
+      local mode="sbo"
+      while [[ "${1:-}" == --* ]]; do
+        case "$1" in
+          --nosbo) mode="nonsbo"; shift ;;
+          --available) mode="available"; shift ;;
+          *) break ;;
+        esac
+      done
+      case "$mode" in
+        sbo)        cmd_list_sbo ;;
+        nonsbo)     cmd_list_non_sbo ;;
+        available)  cmd_list_available ;;
+      esac
+      ;;
+    *)
+      usage; exit 1 ;;
+  esac
+}
+
+main "$@"
+
