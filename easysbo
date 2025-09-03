@@ -49,8 +49,8 @@ UPG_TMP_FILE="/tmp/easysbo-upgrades.$$"     # scratch file during this run
 LOGDIR="./"
 BUILDLOGDIR="./"
 
-# Spinner during noisy build steps (make/cmake/ninja). 1=on, 0=off
-SHOW_SPINNER=1
+# Concurrency lock (prevents two easysbo instances at once)
+LOCKFILE="$WORKDIR/easysbo.lock"
 
 # Optional: allow a prompted fallback for MD5 mismatches on GitHub/PyPI,
 # if filename contains expected VERSION. 0 = strict (default), 1 = prompt.
@@ -71,6 +71,32 @@ abs_path(){
     popd >/dev/null || true
   else
     echo "$d"
+  fi
+}
+
+# Locking
+LOCK_FD=""
+acquire_lock(){
+  install -d -m 0755 "$(dirname "$LOCKFILE")"
+  if command -v flock >/dev/null 2>&1; then
+    # shellcheck disable=SC3003
+    exec {LOCK_FD}>"$LOCKFILE"
+    if ! flock -n "$LOCK_FD"; then
+      die "Another easysbo instance is running (lock: $LOCKFILE)."
+    fi
+  else
+    # flock not available — fallback to mkdir-based lock
+    if ! mkdir "$LOCKFILE.lockdir" 2>/dev/null; then
+      die "Another easysbo instance is running (lockdir: $LOCKFILE.lockdir)."
+    fi
+  fi
+}
+release_lock(){
+  if command -v flock >/dev/null 2>&1; then
+    [[ -n "${LOCK_FD:-}" ]] && eval "exec ${LOCK_FD}>&-"
+    rm -f "$LOCKFILE" 2>/dev/null || true
+  else
+    rm -rf "$LOCKFILE.lockdir" 2>/dev/null || true
   fi
 }
 
@@ -205,7 +231,7 @@ ensure_fresh_tree_before_action(){
   fi
 }
 
-# Remove old <pkg>-error.log files older than 24h on each run
+# Remove old <pkg>-error.log and <pkg>-build.log files older than 24h on each run
 cleanup_old_error_logs(){
   local maxmin=$(( TREE_MAX_AGE / 60 ))
   if [[ "$ERRDIR" != "/dev/null" ]]; then
@@ -466,55 +492,37 @@ copy_recipe_tree(){
 }
 
 inject_error_tee(){
-  # Wrap noisy build tools to log to files and show a spinner instead of spew.
+  # Wrap build tools so stdout still appears on screen AND logs to build.log;
+  # stderr is teed to error.log and also appears on screen.
   local pkg="$1" sb="$2" inj="$2.sbomgr.inj" tmpf="$2.sbomgr.new"
   local errlog="$([[ "$ERRDIR" == "/dev/null" ]] && echo "/dev/null" || echo "$ERRDIR/${pkg}-error.log")"
   local buildlog="$([[ "$BLDLOGDIR_ABS" == "/dev/null" ]] && echo "/dev/null" || echo "$BLDLOGDIR_ABS/${pkg}-build.log")"
-  local spinner="$SHOW_SPINNER"
 
-  cat > "$inj" <<EOF
-# --- easysbo injection: quiet build wrappers with logging and spinner ---
-__easysbo_spin_start() {
-  [ "$spinner" -eq 1 ] || return 0
-  local msg="\$1"; local pidfile="\$2"
-  if [ -t 1 ]; then tput civis 2>/dev/null || true; fi
-  (
-    trap '' INT TERM
-    while :; do
-      for c in '|' '/' '-' '\\\\'; do
-        printf "\\r%s %s" "\$msg" "\$c"
-        sleep 0.2
-      done
-    done
-  ) & echo \$! > "\$pidfile"
-}
-__easysbo_spin_stop() {
-  [ "$spinner" -eq 1 ] || return 0
-  local pidfile="\$1"
-  if [ -f "\$pidfile" ]; then
-    kill "\$(cat "\$pidfile")" 2>/dev/null || true
-    rm -f "\$pidfile"
-    printf "\\r%-80s\\r" ""
-    if [ -t 1 ]; then tput cnorm 2>/dev/null || true; fi
+  cat > "$inj" <<'EOF'
+# --- easysbo injection: visible output + dual logging for build tools ---
+__easysbo_run_log() {
+  # Usage: __easysbo_run_log <cmd> [args...]
+  # - stdout goes to terminal AND (if enabled) to build.log
+  # - stderr goes to terminal AND (if enabled) to error.log
+  local cmd="$1"; shift
+  if [ "$buildlog" != "/dev/null" ] && [ "$errlog" != "/dev/null" ]; then
+    # stderr tee
+    "$cmd" "$@" 2> >(tee -a "$errlog" >&2) | tee -a "$buildlog"
+  elif [ "$buildlog" != "/dev/null" ] && [ "$errlog" = "/dev/null" ]; then
+    "$cmd" "$@" 2>&1 | tee -a "$buildlog"
+  elif [ "$buildlog" = "/dev/null" ] && [ "$errlog" != "/dev/null" ]; then
+    "$cmd" "$@" 2> >(tee -a "$errlog" >&2)
+  else
+    "$cmd" "$@"
   fi
 }
-__easysbo_run_quiet() {
-  # Usage: __easysbo_run_quiet <label> <cmd> [args...]
-  local label="\$1"; shift
-  local pidf=".easysbo-\${label}.pid"
-  __easysbo_spin_start "\$label" "\$pidf"
-  # stdout -> buildlog, stderr -> errorlog, nothing to terminal
-  "\$@" >>"$buildlog" 2>>"$errlog"
-  local rc=\$?
-  __easysbo_spin_stop "\$pidf"
-  return \$rc
-}
-cmake() { __easysbo_run_quiet "cmake" command cmake "\$@"; }
-make()  { __easysbo_run_quiet "make"  command make  "\$@"; }
-ninja() { __easysbo_run_quiet "ninja" command ninja "\$@"; }
+cmake() { __easysbo_run_log command cmake "$@"; }
+make()  { __easysbo_run_log command make  "$@"; }
+ninja() { __easysbo_run_log command ninja "$@"; }
 # --- end easysbo injection ---
 EOF
-  { head -n 1 "$sb"; cat "$inj"; tail -n +2 "$sb"; } > "$tmpf"
+  # Replace only after line 1 to preserve shebang and env in SlackBuild
+  { head -n 1 "$sb"; echo "errlog=\"$errlog\""; echo "buildlog=\"$buildlog\""; cat "$inj"; tail -n +2 "$sb"; } > "$tmpf"
   touch -r "$sb" "$tmpf"
   mv -f "$tmpf" "$sb"; rm -f "$inj"
 
@@ -579,7 +587,7 @@ run_slackbuild(){
 
   msg "Building $pkg (ARCH=$ARCH)…"
   set +e
-  ( cd "$builddir" && /bin/bash "$sb" ) >>"$buildlog" 2>>"$errlog"
+  ( cd "$builddir" && /bin/bash "$sb" )
   rc=$?
   set -e
   rm -f "$builddir/.easysbo-building" 2>/dev/null || true
@@ -1308,8 +1316,8 @@ Settings:
     Build logs (stdout) are saved as <pkg>-build.log in: $(abs_path "$BUILDLOGDIR")
     Tip: set to /dev/null to disable build logs entirely.
 
-  SHOW_SPINNER=$SHOW_SPINNER
-    1=show a spinner during make/cmake/ninja, 0=leave output behavior to the script.
+  LOCKFILE="$LOCKFILE"
+    File used to prevent concurrent runs. Remove if a previous run crashed.
 
   ALLOW_MD5_FALLBACK_FOR_VCS=$ALLOW_MD5_FALLBACK_FOR_VCS
     0=strict MD5 (default). 1=On GitHub/PyPI mismatch, prompt to proceed
@@ -1331,6 +1339,8 @@ consume_yn_commands(){
 main(){
   need_root
   ensure_dirs
+  acquire_lock
+  trap 'release_lock' EXIT INT TERM
   cleanup_leftovers
   cleanup_old_error_logs
   RUN_MARKER="$([[ "$ERRDIR" == "/dev/null" ]] && echo "/tmp/.easysbo-run.$$" || echo "$ERRDIR/.easysbo-run.$$")"
