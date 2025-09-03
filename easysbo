@@ -5,7 +5,7 @@
 set -euo pipefail
 
 #===============================================================================
-# CONFIG — user-tunable knobs
+# CONFIG — user-tunable settings
 #===============================================================================
 WORKDIR="/etc/easysbo"
 SBO_PARENT="$WORKDIR/SBo"              # local SBo trees: $SBO_PARENT/<branch>
@@ -42,9 +42,58 @@ TREE_MAX_AGE=86400   # 24 hours
 UPG_LAST_FILE="/tmp/easysbo-upgrades.last"  # latest completed scan (human-readable)
 UPG_TMP_FILE="/tmp/easysbo-upgrades.$$"     # scratch file during this run
 
+# ===== Logging destinations =====
+# Error logs: <LOGDIR>/<pkg>-error.log
+# Build logs: <BUILDLOGDIR>/<pkg>-build.log
+# Tip: Set either (or both) to /dev/null if you do NOT want that log produced.
+LOGDIR="./"
+BUILDLOGDIR="./"
+
+# Spinner during noisy build steps (make/cmake/ninja). 1=on, 0=off
+SHOW_SPINNER=1
+
+# Optional: allow a prompted fallback for MD5 mismatches on GitHub/PyPI,
+# if filename contains expected VERSION. 0 = strict (default), 1 = prompt.
+ALLOW_MD5_FALLBACK_FOR_VCS=0
+
 #===============================================================================
 # LEFTOVER CLEANUP (Ctrl-C debris, stale temps)
 #===============================================================================
+msg(){ echo "==> $*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "run as root"; }
+
+abs_path(){
+  local d="$1"
+  if [[ "$d" == "/dev/null" ]]; then echo "/dev/null"; return; fi
+  if pushd "$d" >/dev/null 2>&1; then
+    pwd
+    popd >/dev/null || true
+  else
+    echo "$d"
+  fi
+}
+
+ERRDIR=""
+BLDLOGDIR_ABS=""
+
+ensure_dir_for(){
+  # sets global OUTVAR to absolute dir path (or /dev/null)
+  local want="$1" __outvar="$2"
+  local abs
+  if [[ "$want" == "/dev/null" ]]; then
+    printf -v "$__outvar" "/dev/null"
+    return 0
+  fi
+  abs="$(abs_path "$want")"
+  if mkdir -p "$abs" 2>/dev/null; then
+    printf -v "$__outvar" "%s" "$abs"
+  else
+    msg "Dir '$want' not writable; falling back to /tmp"
+    printf -v "$__outvar" "/tmp"
+  fi
+}
+
 cleanup_leftovers(){
   find /tmp -maxdepth 1 -type f -name 'easysbo-upgrades.*' ! -name 'easysbo-upgrades.last' \
        -mmin +5 -print -delete 2>/dev/null | sed 's/^/==> Removing stale scan temp: /'
@@ -57,21 +106,17 @@ cleanup_leftovers(){
           fi
         done
   fi
-  find /tmp -maxdepth 1 -type f -name '*-error.log' -size 0 -print -delete 2>/dev/null \
-    | sed 's/^/==> Removing empty error log: /'
 }
 
 #===============================================================================
 # DETECTION & PATHS
 #===============================================================================
 
-msg(){ echo "==> $*"; }
-die(){ echo "ERROR: $*" >&2; exit 1; }
-need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "run as root"; }
-
 ensure_dirs(){
   install -d -m 0755 "$WORKDIR" "$SBO_PARENT" "$BUILDROOT" "$SRCROOT"
   install -d -m 0755 "$TMPROOT" "$OUTBASE"
+  ensure_dir_for "$LOGDIR" ERRDIR
+  ensure_dir_for "$BUILDLOGDIR" BLDLOGDIR_ABS
 }
 
 arch_token() {
@@ -160,20 +205,22 @@ ensure_fresh_tree_before_action(){
   fi
 }
 
-# Remove old /tmp/*-error.log files older than 24h on each run
+# Remove old <pkg>-error.log files older than 24h on each run
 cleanup_old_error_logs(){
   local maxmin=$(( TREE_MAX_AGE / 60 ))
-  find /tmp -maxdepth 1 -type f -name '*-error.log' -mmin +$maxmin -print -delete 2>/dev/null \
-    | sed 's/^/==> Removing old error log: /'
+  if [[ "$ERRDIR" != "/dev/null" ]]; then
+    find "$ERRDIR" -maxdepth 1 -type f -name '*-error.log' -mmin +$maxmin -print -delete 2>/dev/null \
+      | sed 's/^/==> Removing old error log: /'
+    find "$ERRDIR" -maxdepth 1 -type f -name '*-error.log' -size 0 -print -delete 2>/dev/null \
+      | sed 's/^/==> Removing empty error log: /'
+  fi
+  if [[ "$BLDLOGDIR_ABS" != "/dev/null" ]]; then
+    find "$BLDLOGDIR_ABS" -maxdepth 1 -type f -name '*-build.log' -mmin +$maxmin -print -delete 2>/dev/null \
+      | sed 's/^/==> Removing old build log: /'
+    find "$BLDLOGDIR_ABS" -maxdepth 1 -type f -name '*-build.log' -size 0 -print -delete 2>/dev/null \
+      | sed 's/^/==> Removing empty build log: /'
+  fi
 }
-
-# On exit, restore cursor & clean tmp
-cleanup_tmp(){
-  tput cnorm 2>/dev/null || true
-  [[ -f "$UPG_TMP_FILE" ]] && rm -f "$UPG_TMP_FILE"
-  [[ -f "$RUN_MARKER" ]] && rm -f "$RUN_MARKER"
-}
-trap cleanup_tmp EXIT
 
 #===============================================================================
 # BUILD INFORMATION (per-run constants)
@@ -183,7 +230,7 @@ SLACKVERSION="$(cat /etc/slackware-version 2>/dev/null || echo 'unknown')"
 KERNEL="$(uname -r)"
 
 # Marker for this run (used to detect new error logs)
-RUN_MARKER="/tmp/.easysbo-run.$$"
+RUN_MARKER=""
 
 #===============================================================================
 # VERSION & PACKAGE PARSING HELPERS
@@ -246,14 +293,16 @@ info_get_download_sets(){
   urls="$(printf "%s\n%s\n" "$u" "$(info_get_var "$info" 'DOWNLOAD')" | sed '/^[[:space:]]*$/d')"
   md5s="$(printf "%s\n%s\n" "$m" "$(info_get_var "$info" 'MD5SUM')"   | sed '/^[[:space:]]*$/d')"
 
-  # Normalize
+  # Normalize to one-per-line; drop empty/placeholder slugs and stray backslashes
   urls="$(echo "$urls" | tr ' \t' '\n' | sed '/^$/d;/^\\/d;/^[A-Za-z0-9._-]*$/d;/^[[:space:]]*$/d' | grep -E '^[a-z]+://')"
-  md5s="$(echo "$md5s" | tr ' \t' '\n' | sed '/^$/d')"
+
+  # Keep only proper 32-hex MD5 tokens; drop line-continuations and junk
+  md5s="$(echo "$md5s" | tr ' \t' '\n' | sed '/^$/d' | grep -E '^[0-9a-fA-F]{32}$')"
 
   printf "%s\n--SEP--\n%s\n" "$urls" "$md5s"
 }
 
-is_installed(){ ls "/var/log/packages/${1}-"* >/dev/null 2>&1; }
+is_installed(){ ls "/var/log/packages/${1}-"* >/dev/null 2>/dev/null; }
 
 installed_version(){
   local name="$1" rec base meta ver
@@ -270,9 +319,9 @@ is_base_pkg(){ local p="$1"; for b in "${BASE_PKGS_IGNORE[@]}"; do [[ "$p" == "$
 fetch_with(){
   local url="$1" dest="$2" errlog="${3:-}"
   if command -v curl >/dev/null 2>&1; then
-    if [[ -n "$errlog" ]]; then
+    if [[ -n "$errlog" && "$errlog" != "/dev/null" ]]; then
       if ! curl -fL --retry 3 --retry-delay 2 -o "$dest" "$url" 2> >(tee -a "$errlog" >&2); then
-        rm -f "$dest"; echo "Fetch error for: $url" >>"$errlog"; die "Source fetch failed (HTTP/network) for: $url"
+        rm -f "$dest"; [[ "$errlog" != "/dev/null" ]] && echo "Fetch error for: $url" >>"$errlog"; die "Source fetch failed (HTTP/network) for: $url"
       fi
     else
       if ! curl -fL --retry 3 --retry-delay 2 -o "$dest" "$url"; then
@@ -280,7 +329,7 @@ fetch_with(){
       fi
     fi
   elif command -v wget >/dev/null 2>&1; then
-    if [[ -n "$errlog" ]]; then
+    if [[ -n "$errlog" && "$errlog" != "/dev/null" ]]; then
       if ! wget --tries=3 --retry-connrefused -O "$dest" "$url" 2> >(tee -a "$errlog" >&2); then
         rm -f "$dest"; echo "Fetch error for: $url" >>"$errlog"; die "Source fetch failed for: $url"
       fi
@@ -292,7 +341,7 @@ fetch_with(){
   else
     die "Neither curl nor wget available to fetch sources"
   fi
-  [[ -s "$dest" ]] || { rm -f "$dest"; [[ -n "$errlog" ]] && echo "Downloaded file empty for: $url" >>"$errlog"; die "Downloaded file is empty for: $url"; }
+  [[ -s "$dest" ]] || { rm -f "$dest"; [[ -n "$errlog" && "$errlog" != "/dev/null" ]] && echo "Downloaded file empty for: $url" >>"$errlog"; die "Downloaded file is empty for: $url"; }
 }
 
 md5_ok(){ local file="$1" want="$2"; [[ -f "$file" ]] || return 1; local got; got=$(md5sum "$file" | awk '{print $1}'); [[ "$got" == "$want" ]]; }
@@ -310,9 +359,9 @@ download_sources(){
   fi
 
   if [[ -z "${urls//[[:space:]]/}" ]]; then
-    errlog="/tmp/${pkg}-error.log"; : > "$errlog"
-    echo "No valid DOWNLOAD URLs parsed from .info for $pkg" >>"$errlog"
-    echo "Errors occurred, please check $errlog"
+    errlog="$ERRDIR/${pkg}-error.log"; [[ "$ERRDIR" != "/dev/null" ]] && : > "$errlog"
+    [[ "$ERRDIR" != "/dev/null" ]] && echo "No valid DOWNLOAD URLs parsed from .info for $pkg" >>"$errlog"
+    [[ "$ERRDIR" != "/dev/null" ]] && echo "Errors occurred, please check $errlog"
     die "No valid DOWNLOAD URLs found for $pkg"
   fi
 
@@ -324,8 +373,8 @@ download_sources(){
     msg "MD5 count differs from DOWNLOAD count for $pkg; will verify where provided."
   fi
 
-  local i; errlog="/tmp/${pkg}-error.log"
-  : > "$errlog"
+  local i; errlog="$ERRDIR/${pkg}-error.log"
+  [[ "$ERRDIR" != "/dev/null" ]] && : > "$errlog"
 
   local any_fetched=0
   for i in "${!URLA[@]}"; do
@@ -335,34 +384,77 @@ download_sources(){
     dest="$SRCROOT/$pkg/$base"
     want="${MD5A[$i]:-}"
 
-    if [[ -n "$want" ]] && [[ -f "$dest" ]] && md5_ok "$dest" "$want"; then
+    # Cached & matches MD5
+    if [[ "$want" =~ ^[0-9a-fA-F]{32}$ ]] && [[ -f "$dest" ]] && md5_ok "$dest" "$want"; then
       msg "Source OK (cached): $base"
       any_fetched=1
       continue
     fi
 
     msg "Fetching: $url"
-    fetch_with "$url" "$dest" "$errlog"
+    fetch_with "$url" "$dest" "$([[ "$ERRDIR" != "/dev/null" ]] && echo "$errlog" || echo "")"
 
-    if [[ -n "$want" ]]; then
-      if ! md5_ok "$dest" "$want"; then
-        echo "MD5 mismatch for $base (expected $want)" >>"$errlog"
-        echo "Errors occurred, please check $errlog"
-        rm -f "$dest"; die "MD5 mismatch for $base in $pkg"
+    # Validate
+    if [[ "$want" =~ ^[0-9a-fA-F]{32}$ ]]; then
+      local got
+      got="$(md5sum "$dest" | awk '{print $1}')"
+      if [[ "$got" != "$want" ]]; then
+        # Heuristic fallback option for GitHub/PyPI tarballs where MD5s churn
+        if [[ "$ALLOW_MD5_FALLBACK_FOR_VCS" -eq 1 ]] && echo "$url" | grep -Eq 'github\.com|files\.pythonhosted\.org'; then
+          if [[ -n "$version" ]] && echo "$base" | grep -q "$version"; then
+            if prompt_yes "MD5 mismatch for $base (expected $want, got $got). Proceed based on versioned filename? Y/n "; then
+              [[ "$ERRDIR" != "/dev/null" ]] && echo "MD5 mismatch ignored by user for $base (GitHub/PyPI heuristic)" >>"$errlog"
+            else
+              if [[ "$ERRDIR" != "/dev/null" ]]; then
+                {
+                  echo "MD5 mismatch for $base"
+                  echo "  expected: $want"
+                  echo "  got     : $got"
+                  echo "  url     : $url"
+                } >>"$errlog"
+                echo "Errors occurred, please check $errlog"
+              fi
+              rm -f "$dest"; die "MD5 mismatch for $base in $pkg"
+            fi
+          else
+            if [[ "$ERRDIR" != "/dev/null" ]]; then
+              {
+                echo "MD5 mismatch for $base (and filename does not contain VERSION='$version')"
+                echo "  expected: $want"
+                echo "  got     : $got"
+                echo "  url     : $url"
+              } >>"$errlog"
+              echo "Errors occurred, please check $errlog"
+            fi
+            rm -f "$dest"; die "MD5 mismatch for $base in $pkg"
+          fi
+        else
+          if [[ "$ERRDIR" != "/dev/null" ]]; then
+            {
+              echo "MD5 mismatch for $base"
+              echo "  expected: $want"
+              echo "  got     : $got"
+              echo "  url     : $url"
+            } >>"$errlog"
+            echo "Errors occurred, please check $errlog"
+          fi
+          rm -f "$dest"; die "MD5 mismatch for $base in $pkg"
+        fi
       fi
     else
+      # No (useful) MD5 provided → fallback to filename containing VERSION
       if [[ -n "$version" ]] && ! echo "$base" | grep -q "$version"; then
-        echo "Wrong version file for $pkg: expected contains VERSION='$version', got '$base'" >>"$errlog"
-        echo "Errors occurred, please check $errlog"
+        [[ "$ERRDIR" != "/dev/null" ]] && echo "Wrong version file for $pkg: expected contains VERSION='$version', got '$base'" >>"$errlog"
+        [[ "$ERRDIR" != "/dev/null" ]] && echo "Errors occurred, please check $errlog"
         rm -f "$dest"; die "Wrong version for $pkg: $base"
       fi
     fi
 
-    [[ -s "$dest" ]] || { echo "Downloaded empty file: $base" >>"$errlog"; echo "Errors occurred, please check $errlog"; rm -f "$dest"; die "Source file missing or empty after download: $base"; }
+    [[ -s "$dest" ]] || { [[ "$ERRDIR" != "/dev/null" ]] && echo "Downloaded empty file: $base" >>"$errlog"; [[ "$ERRDIR" != "/dev/null" ]] && echo "Errors occurred, please check $errlog"; rm -f "$dest"; die "Source file missing or empty after download: $base"; }
     any_fetched=1
   done
 
-  if [[ -f "$errlog" && ! -s "$errlog" ]]; then rm -f "$errlog"; fi
+  if [[ "$ERRDIR|$errlog" != "/dev/null|" && -f "$errlog" && ! -s "$errlog" ]]; then rm -f "$errlog"; fi
   [[ $any_fetched -ge 0 ]] || true
 }
 
@@ -374,18 +466,61 @@ copy_recipe_tree(){
 }
 
 inject_error_tee(){
+  # Wrap noisy build tools to log to files and show a spinner instead of spew.
   local pkg="$1" sb="$2" inj="$2.sbomgr.inj" tmpf="$2.sbomgr.new"
-  local errlog="/tmp/${pkg}-error.log"
+  local errlog="$([[ "$ERRDIR" == "/dev/null" ]] && echo "/dev/null" || echo "$ERRDIR/${pkg}-error.log")"
+  local buildlog="$([[ "$BLDLOGDIR_ABS" == "/dev/null" ]] && echo "/dev/null" || echo "$BLDLOGDIR_ABS/${pkg}-build.log")"
+  local spinner="$SHOW_SPINNER"
+
   cat > "$inj" <<EOF
-# --- easysbo injection: tee build stderr to $errlog ---
-cmake() { command cmake "\$@" 2> >(tee -a "$errlog" >&2); }
-make()  { command make  "\$@"  2> >(tee -a "$errlog" >&2); }
-ninja() { command ninja "\$@" 2> >(tee -a "$errlog" >&2); }
+# --- easysbo injection: quiet build wrappers with logging and spinner ---
+__easysbo_spin_start() {
+  [ "$spinner" -eq 1 ] || return 0
+  local msg="\$1"; local pidfile="\$2"
+  if [ -t 1 ]; then tput civis 2>/dev/null || true; fi
+  (
+    trap '' INT TERM
+    while :; do
+      for c in '|' '/' '-' '\\\\'; do
+        printf "\\r%s %s" "\$msg" "\$c"
+        sleep 0.2
+      done
+    done
+  ) & echo \$! > "\$pidfile"
+}
+__easysbo_spin_stop() {
+  [ "$spinner" -eq 1 ] || return 0
+  local pidfile="\$1"
+  if [ -f "\$pidfile" ]; then
+    kill "\$(cat "\$pidfile")" 2>/dev/null || true
+    rm -f "\$pidfile"
+    printf "\\r%-80s\\r" ""
+    if [ -t 1 ]; then tput cnorm 2>/dev/null || true; fi
+  fi
+}
+__easysbo_run_quiet() {
+  # Usage: __easysbo_run_quiet <label> <cmd> [args...]
+  local label="\$1"; shift
+  local pidf=".easysbo-\${label}.pid"
+  __easysbo_spin_start "\$label" "\$pidf"
+  # stdout -> buildlog, stderr -> errorlog, nothing to terminal
+  "\$@" >>"$buildlog" 2>>"$errlog"
+  local rc=\$?
+  __easysbo_spin_stop "\$pidf"
+  return \$rc
+}
+cmake() { __easysbo_run_quiet "cmake" command cmake "\$@"; }
+make()  { __easysbo_run_quiet "make"  command make  "\$@"; }
+ninja() { __easysbo_run_quiet "ninja" command ninja "\$@"; }
 # --- end easysbo injection ---
 EOF
   { head -n 1 "$sb"; cat "$inj"; tail -n +2 "$sb"; } > "$tmpf"
   touch -r "$sb" "$tmpf"
   mv -f "$tmpf" "$sb"; rm -f "$inj"
+
+  # Announce log locations once at build start
+  [[ "$BLDLOGDIR_ABS" != "/dev/null" ]] && echo "    (build log: $BLDLOGDIR_ABS/${pkg}-build.log)"
+  [[ "$ERRDIR" != "/dev/null" ]] && echo "    (error log: $ERRDIR/${pkg}-error.log)"
 }
 
 augment_slack_desc(){
@@ -408,22 +543,29 @@ augment_slack_desc(){
 
 report_nonempty_error_logs_since_marker(){
   local found=0
+  if [[ "$ERRDIR" == "/dev/null" ]]; then return 0; fi
   while IFS= read -r -d '' f; do
     if [[ -s "$f" ]]; then
       echo "Errors occurred, please check $f"
       found=1
     fi
-  done < <(find /tmp -maxdepth 1 -type f -name '*-error.log' -newer "$RUN_MARKER" -print0 2>/dev/null)
+  done < <(find "$ERRDIR" -maxdepth 1 -type f -name '*-error.log' -newer "$RUN_MARKER" -print0 2>/dev/null)
   return $found
 }
 
 run_slackbuild(){
   local pkg="$1" builddir="$2"
-  local sb errlog outpkg rc
+  local sb errlog buildlog outpkg rc
   sb="$(find "$builddir" -maxdepth 1 -type f -name "*.SlackBuild" | head -n1)" || true
   [[ -n "$sb" ]] || die "No *.SlackBuild found for $pkg"
+
   : > "$builddir/.easysbo-building"
-  errlog="/tmp/${pkg}-error.log"; : > "$errlog"
+
+  errlog="$([[ "$ERRDIR" == "/dev/null" ]] && echo "/dev/null" || echo "$ERRDIR/${pkg}-error.log")"
+  buildlog="$([[ "$BLDLOGDIR_ABS" == "/dev/null" ]] && echo "/dev/null" || echo "$BLDLOGDIR_ABS/${pkg}-build.log")"
+  [[ "$ERRDIR" != "/dev/null" ]] && : > "$errlog"
+  [[ "$BLDLOGDIR_ABS" != "/dev/null" ]] && : > "$buildlog"
+
   augment_slack_desc "$pkg" "$builddir"
   inject_error_tee "$pkg" "$sb"
   chmod +x "$sb"
@@ -434,17 +576,21 @@ run_slackbuild(){
   if [[ -d "$SRCROOT/$pkg" ]]; then
     (cd "$SRCROOT/$pkg" && for f in *; do [[ -f "$f" ]] && ln -sf "$PWD/$f" "$builddir/$f"; done)
   fi
+
   msg "Building $pkg (ARCH=$ARCH)…"
   set +e
-  ( cd "$builddir" && /bin/bash "$sb" )
+  ( cd "$builddir" && /bin/bash "$sb" ) >>"$buildlog" 2>>"$errlog"
   rc=$?
   set -e
   rm -f "$builddir/.easysbo-building" 2>/dev/null || true
   if [[ $rc -ne 0 ]]; then
-    msg "Build FAILED for $pkg (see $errlog)"
+    msg "Build FAILED for $pkg (see $([[ "$ERRDIR" == "/dev/null" ]] && echo 'error log disabled' || echo "$errlog"))"
     return $rc
   fi
-  [[ -f "$errlog" ]] && rm -f "$errlog"
+
+  # Success: remove empty error log if exists
+  if [[ "$ERRDIR" != "/dev/null" && -f "$errlog" && ! -s "$errlog" ]]; then rm -f "$errlog"; fi
+
   local try=0
   while (( try < 3 )); do
     outpkg=$(ls -1t "$OUTPUT"/${pkg}-*.t?z 2>/dev/null | head -n1 || true)
@@ -748,12 +894,9 @@ sbo_upgradable_scan(){
 #===============================================================================
 tar_to_abs(){
   local arg="$1"
-  # If the user gave a path, use it as-is.
   if [[ "$arg" == */* ]]; then
-    echo "$arg"
-    return
+    echo "$arg"; return
   fi
-  # No path component: prefer ./arg if it exists; else fall back to $HOME/arg.
   if [[ -f "./$arg" ]]; then
     echo "./$arg"
   else
@@ -838,8 +981,7 @@ cmd_install(){
 
     local prep pkg builddir info
     prep="$(prepare_local_target "$tarball")"
-    pkg="${prep%%|*}"; prep="${prep#*|}"
-    builddir="${prep%%|*}"; info="${prep#*|}"
+    pkg="${prep%%|*}"; prep="${prep#*|}"; builddir="${prep%%|*}"; info="${prep#*|}"
 
     VISITING=(); VISITED=(); RESOLVED=()
     if [[ -n "$info" ]]; then
@@ -871,7 +1013,7 @@ cmd_install(){
       install_or_upgrade_pkg "install" "$op" "$p"
     done
 
-    # Build target from local tar dir, use its info if present for sources
+    # Build target
     if [[ -n "$info" ]]; then
       msg "Preparing $pkg (local SlackBuild)"
       download_sources "$pkg" "$info"
@@ -931,7 +1073,7 @@ upgrade_one(){
 
   prompt_missing_deps_once "$target"
 
-  # Build any missing deps first
+  # Build missing deps first
   for pkg in "${RESOLVED[@]}"; do
     [[ "$pkg" == "$target" ]] && continue
     if is_base_pkg "$pkg" || is_installed "$pkg"; then continue; fi
@@ -1011,8 +1153,7 @@ cmd_upgrade(){
 
     local prep pkg builddir info
     prep="$(prepare_local_target "$tarball")"
-    pkg="${prep%%|*}"; prep="${prep#*|}"
-    builddir="${prep%%|*}"; info="${prep#*|}"
+    pkg="${prep%%|*}"; prep="${prep#*|}"; builddir="${prep%%|*}"; info="${prep#*|}"
 
     VISITING=(); VISITED=(); RESOLVED=()
     if [[ -n "$info" ]]; then
@@ -1158,24 +1299,21 @@ Usage:
     -N                 Assume 'No' to all prompts (overrides -Y).
     -help              Show this help.
 
-Output locations (sbopkg-like):
-  TMP:      $TMPROOT
-  Packages: $OUTBASE/<pkg>/*.t?z
+Settings:
+  LOGDIR="$LOGDIR"
+    Error logs are saved as <pkg>-error.log in: $(abs_path "$LOGDIR")
+    Tip: set to /dev/null to disable error logs entirely.
 
-Notes:
-  * On start, leftover temps and old/empty error logs are cleaned.
-  * Tree freshness: before -install/-upgrade, if the local SBo tree is >24h old,
-    an automatic -update is performed (except during --dryrun). Stamp:
-    \$SBO_PARENT/<branch>/.easysbo-updated
-  * Upgrade scans show a live progress line and write results to a temp file,
-    then display them. Last results copied to: $UPG_LAST_FILE
-  * Strict source checks: HTTP errors, empties, MD5 mismatches fail the run.
-  * If no MD5s, filenames must contain VERSION from .info; otherwise fail.
-  * 'UNSUPPORTED' downloads cause an immediate error (manual fetch required).
-  * On successful build, /tmp/<pkg>-error.log is removed; on failure it remains,
-    and a summary line is printed after the command ends.
-  * Each package’s slack_desc gains a "# Build information" block with:
-      Built on (UTC), Slackware version, Kernel.
+  BUILDLOGDIR="$BUILDLOGDIR"
+    Build logs (stdout) are saved as <pkg>-build.log in: $(abs_path "$BUILDLOGDIR")
+    Tip: set to /dev/null to disable build logs entirely.
+
+  SHOW_SPINNER=$SHOW_SPINNER
+    1=show a spinner during make/cmake/ninja, 0=leave output behavior to the script.
+
+  ALLOW_MD5_FALLBACK_FOR_VCS=$ALLOW_MD5_FALLBACK_FOR_VCS
+    0=strict MD5 (default). 1=On GitHub/PyPI mismatch, prompt to proceed
+    if filename contains expected VERSION (respects -Y / -N).
 EOF
 }
 
@@ -1195,6 +1333,7 @@ main(){
   ensure_dirs
   cleanup_leftovers
   cleanup_old_error_logs
+  RUN_MARKER="$([[ "$ERRDIR" == "/dev/null" ]] && echo "/tmp/.easysbo-run.$$" || echo "$ERRDIR/.easysbo-run.$$")"
   : > "$RUN_MARKER"
 
   [[ $# -ge 1 ]] || { usage; exit 1; }
@@ -1243,4 +1382,3 @@ main(){
 }
 
 main "$@"
-
